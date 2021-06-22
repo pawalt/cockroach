@@ -1779,6 +1779,11 @@ func (ds *DistSender) sendToReplicas(
 		log.VEvent(ctx, 2, "routing to nearest replica; leaseholder not required")
 	}
 
+	for _, val := range replicas {
+		log.VEventf(ctx, 2, "replica %d locality %v", val.NodeID, val.locality())
+	}
+	log.VEventf(ctx, 2, "replicas: %v", replicas)
+
 	opts := SendOptions{
 		class:   rpc.ConnectionClassForKey(desc.RSpan().Key),
 		metrics: &ds.metrics,
