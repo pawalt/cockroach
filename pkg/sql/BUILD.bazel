@@ -557,6 +557,7 @@ go_test(
         "//pkg/sql/flowinfra",
         "//pkg/sql/gcjob",
         "//pkg/sql/lex",
+        "//pkg/sql/lexbase",
         "//pkg/sql/mutations",
         "//pkg/sql/opt/exec/explain",
         "//pkg/sql/parser",
