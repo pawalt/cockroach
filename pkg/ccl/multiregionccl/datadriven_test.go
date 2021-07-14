@@ -127,21 +127,10 @@ func TestMultiRegionDataDriven(t *testing.T) {
 				serverArgs := make(map[int]base.TestServerArgs)
 				localityNames := strings.Split(localities, ",")
 				recCh = make(chan tracing.Recording, 1)
-				regionCount := make(map[string]int)
 				for i, localityName := range localityNames {
-					if val, found := regionCount[localityName]; !found {
-						regionCount[localityName] = 0
-					} else {
-						regionCount[localityName] = val + 1
-					}
-					ind := regionCount[localityName]
-					// Sequentially generate zone names (us-east-1a, us-east-1b, ...).
-					zoneLabel := rune(ind + 97)
-					localityCfg := roachpb.Locality{
-						Tiers: []roachpb.Tier{
-							{Key: "region", Value: localityName},
-							{Key: "zone", Value: localityName + string(zoneLabel)},
-						},
+					localityCfg, found := localityCfgs[localityName]
+					if !found {
+						t.Fatalf("cannot create a server in locality %s", localityName)
 					}
 					serverArgs[i] = base.TestServerArgs{
 						Locality: localityCfg,
@@ -575,6 +564,46 @@ func parseUserReplicas(t *testing.T, d *datadriven.TestData) map[replicaType][]i
 	}
 
 	return userReplicas
+}
+
+// Set of localities to choose from for the data-driven test.
+var localityCfgs = map[string]roachpb.Locality{
+	"us-east-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "us-east-1"},
+			{Key: "availability-zone", Value: "us-east-1a"},
+		},
+	},
+	"us-central-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "us-central-1"},
+			{Key: "availability-zone", Value: "us-central-1a"},
+		},
+	},
+	"us-west-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "us-west-1"},
+			{Key: "availability-zone", Value: "us-west-1a"},
+		},
+	},
+	"eu-east-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "eu-east-1"},
+			{Key: "availability-zone", Value: "eu-east-1a"},
+		},
+	},
+	"eu-central-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "eu-central-1"},
+			{Key: "availability-zone", Value: "eu-central-1a"},
+		},
+	},
+	"eu-west-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "eu-west-1"},
+			{Key: "availability-zone", Value: "eu-west-1a"},
+		},
+	},
 }
 
 func nodeIdToIdx(t *testing.T, tc serverutils.TestClusterInterface, id roachpb.NodeID) int {
