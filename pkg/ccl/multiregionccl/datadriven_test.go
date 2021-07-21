@@ -130,21 +130,10 @@ func TestMultiRegionDataDriven(t *testing.T) {
 				serverArgs := make(map[int]base.TestServerArgs)
 				localityNames := strings.Split(localities, ",")
 				recCh = make(chan tracing.Recording, 1)
-				regionCount := make(map[string]int)
 				for i, localityName := range localityNames {
-					if val, found := regionCount[localityName]; !found {
-						regionCount[localityName] = 0
-					} else {
-						regionCount[localityName] = val + 1
-					}
-					ind := regionCount[localityName]
-					// Sequentially generate zone names (us-east-1a, us-east-1b, ...).
-					zoneLabel := rune(ind + 97)
-					localityCfg := roachpb.Locality{
-						Tiers: []roachpb.Tier{
-							{Key: "region", Value: localityName},
-							{Key: "zone", Value: localityName + string(zoneLabel)},
-						},
+					localityCfg, found := localityCfgs[localityName]
+					if !found {
+						t.Fatalf("cannot create a server in locality %s", localityName)
 					}
 					serverArgs[i] = base.TestServerArgs{
 						Locality: localityCfg,
@@ -317,10 +306,9 @@ func TestMultiRegionDataDriven(t *testing.T) {
 					expectedPlacement := parseReplicasFromInput(t, ds.tc, d)
 					// Get current replica type info from range and validate against
 					// user-specified replica types
-					actualPlacement := parseReplicasFromRange(t, ds.tc, desc)
-
-					if !actualPlacement.hasLeaseholderInfo() {
-						return errors.Newf("could not find lease holder for %s", tbName)
+					actualPlacement, err := parseReplicasFromRange(t, ds.tc, desc)
+					if err != nil {
+						return err
 					}
 
 					leaseHolderNode := ds.tc.Server(actualPlacement.getLeaseholder())
@@ -585,17 +573,18 @@ func parseReplicasFromInput(
 // parseReplicasFromInput constructs a replicaPlacement from a range descriptor.
 func parseReplicasFromRange(
 	t *testing.T, tc serverutils.TestClusterInterface, desc roachpb.RangeDescriptor,
-) *replicaPlacement {
+) (*replicaPlacement, error) {
 	ret := replicaPlacement{}
-	ret.leaseholder = -1
 
 	replicaMap := make(map[int]replicaType)
 
 	leaseHolder, err := tc.FindRangeLeaseHolder(desc, nil)
 	if err != nil {
-		t.Fatalf("could not get leaseholder: %v", err)
+		return nil, errors.Newf("could not get leaseholder: %v", err)
 	}
-	replicaMap[nodeIdToIdx(t, tc, leaseHolder.NodeID)] = replicaTypeLeaseholder
+	leaseHolderIdx := nodeIdToIdx(t, tc, leaseHolder.NodeID)
+	replicaMap[leaseHolderIdx] = replicaTypeLeaseholder
+	ret.leaseholder = leaseHolderIdx
 
 	for _, replica := range desc.Replicas().VoterDescriptors() {
 		idx := nodeIdToIdx(t, tc, replica.NodeID)
@@ -609,7 +598,7 @@ func parseReplicasFromRange(
 		if rt, found := replicaMap[idx]; !found {
 			replicaMap[idx] = replicaTypeNonVoter
 		} else {
-			t.Fatalf("expected not to find non-voter %d in replica map but found %s",
+			return nil, errors.Newf("expected not to find non-voter %d in replica map but found %s",
 				idx, rt.String())
 		}
 	}
@@ -626,13 +615,7 @@ func parseReplicasFromRange(
 	}
 	ret.replicaTypeToNodes = reversed
 
-	if leaseholders := reversed[replicaTypeLeaseholder]; len(leaseholders) == 1 {
-		ret.leaseholder = leaseholders[0]
-	} else if len(leaseholders) > 1 {
-		t.Fatalf("got more than one leaseholder: %d", len(leaseholders))
-	}
-
-	return &ret
+	return &ret, nil
 }
 
 // satisfiesExpectedPlacement returns nil if the expected replicaPlacement is a
@@ -682,4 +665,44 @@ func (r *replicaPlacement) getLeaseholder() int {
 
 func (r *replicaPlacement) getReplicaType(nodeIdx int) replicaType {
 	return r.nodeToReplicaType[nodeIdx]
+}
+
+// Set of localities to choose from for the data-driven test.
+var localityCfgs = map[string]roachpb.Locality{
+	"us-east-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "us-east-1"},
+			{Key: "availability-zone", Value: "us-east-1a"},
+		},
+	},
+	"us-central-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "us-central-1"},
+			{Key: "availability-zone", Value: "us-central-1a"},
+		},
+	},
+	"us-west-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "us-west-1"},
+			{Key: "availability-zone", Value: "us-west-1a"},
+		},
+	},
+	"eu-east-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "eu-east-1"},
+			{Key: "availability-zone", Value: "eu-east-1a"},
+		},
+	},
+	"eu-central-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "eu-central-1"},
+			{Key: "availability-zone", Value: "eu-central-1a"},
+		},
+	},
+	"eu-west-1": {
+		Tiers: []roachpb.Tier{
+			{Key: "region", Value: "eu-west-1"},
+			{Key: "availability-zone", Value: "eu-west-1a"},
+		},
+	},
 }
