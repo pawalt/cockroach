@@ -19,11 +19,12 @@ const (
 
 // Format implements the NodeFormatter interface.
 func (node *DataPlacement) Format(ctx *FmtCtx) {
+	ctx.WriteString("PLACEMENT ")
 	switch *node {
 	case DataPlacementRestricted:
-		ctx.WriteString("PLACEMENT RESTRICTED")
+		ctx.WriteString("RESTRICTED")
 	case DataPlacementDefault:
-		ctx.WriteString("PLACEMENT DEFAULT")
+		ctx.WriteString("DEFAULT")
 	default:
 		panic(errors.AssertionFailedf("unknown data placement strategy: %d", *node))
 	}
