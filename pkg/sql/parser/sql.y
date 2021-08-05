@@ -6702,6 +6702,10 @@ col_qualification_elem:
   {
     $$.val = &tree.ColumnDefault{Expr: $2.expr()}
   }
+| ON UPDATE SET b_expr
+  {
+    $$.val = &tree.ColumnOnUpdate{Expr: $2.expr()}
+  }
 | REFERENCES table_name opt_name_parens key_match reference_actions
  {
     name := $2.unresolvedObjectName().ToTableName()

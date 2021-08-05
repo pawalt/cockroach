@@ -428,6 +428,10 @@ type ColumnTableDef struct {
 		Expr           Expr
 		ConstraintName Name
 	}
+	OnUpdateExpr struct {
+		Expr           Expr
+		ConstraintName Name
+	}
 	CheckExprs []ColumnTableDefCheckExpr
 	References struct {
 		Table          *TableName
@@ -522,6 +526,13 @@ func NewColumnTableDef(
 			}
 			d.DefaultExpr.Expr = t.Expr
 			d.DefaultExpr.ConstraintName = c.Name
+		case *ColumnOnUpdate:
+			if d.HasOnUpdateExpr() {
+				return nil, pgerror.Newf(pgcode.Syntax,
+					"multiple on update values specified for column %q", name)
+			}
+			d.OnUpdateExpr.Expr = t.Expr
+			d.OnUpdateExpr.ConstraintName = c.Name
 		case HiddenConstraint:
 			d.Hidden = true
 		case NotNullConstraint:
@@ -588,6 +599,11 @@ func NewColumnTableDef(
 // HasDefaultExpr returns if the ColumnTableDef has a default expression.
 func (node *ColumnTableDef) HasDefaultExpr() bool {
 	return node.DefaultExpr.Expr != nil
+}
+
+// HasOnUpdateExpr returns if the ColumnTableDef has an on update expression.
+func (node *ColumnTableDef) HasOnUpdateExpr() bool {
+	return node.OnUpdateExpr.Expr != nil
 }
 
 // HasFKConstraint returns if the ColumnTableDef has a foreign key constraint.
@@ -659,6 +675,14 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 		}
 		ctx.WriteString(" DEFAULT ")
 		ctx.FormatNode(node.DefaultExpr.Expr)
+	}
+	if node.HasOnUpdateExpr() {
+		if node.OnUpdateExpr.ConstraintName != "" {
+			ctx.WriteString(" CONSTRAINT ")
+			ctx.FormatNode(&node.OnUpdateExpr.ConstraintName)
+		}
+		ctx.WriteString(" ON UPDATE ")
+		ctx.FormatNode(node.OnUpdateExpr.Expr)
 	}
 	for _, checkExpr := range node.CheckExprs {
 		if checkExpr.ConstraintName != "" {
@@ -744,6 +768,7 @@ type ColumnQualification interface {
 
 func (ColumnCollation) columnQualification()             {}
 func (*ColumnDefault) columnQualification()              {}
+func (*ColumnOnUpdate) columnQualification()             {}
 func (NotNullConstraint) columnQualification()           {}
 func (NullConstraint) columnQualification()              {}
 func (HiddenConstraint) columnQualification()            {}
@@ -760,6 +785,11 @@ type ColumnCollation string
 
 // ColumnDefault represents a DEFAULT clause for a column.
 type ColumnDefault struct {
+	Expr Expr
+}
+
+// ColumnOnUpdate represents a ON UPDATE clause for a column.
+type ColumnOnUpdate struct {
 	Expr Expr
 }
 
