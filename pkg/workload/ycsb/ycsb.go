@@ -39,6 +39,10 @@ const (
 	fieldLength    = 100 // In characters
 	zipfIMin       = 0
 
+	timeFormatTemplate = `2006-01-02 15:04:05.000000-07:00`
+)
+
+var (
 	usertableSchemaRelational = `(
 		ycsb_key VARCHAR(255) PRIMARY KEY NOT NULL,
 		FIELD0 TEXT NOT NULL,
@@ -51,6 +55,7 @@ const (
 		FIELD7 TEXT NOT NULL,
 		FIELD8 TEXT NOT NULL,
 		FIELD9 TEXT NOT NULL
+		%s
 	)`
 	usertableSchemaRelationalWithFamilies = `(
 		ycsb_key VARCHAR(255) PRIMARY KEY NOT NULL,
@@ -75,13 +80,13 @@ const (
 		FAMILY (FIELD7),
 		FAMILY (FIELD8),
 		FAMILY (FIELD9)
+		%s
 	)`
 	usertableSchemaJSON = `(
 		ycsb_key VARCHAR(255) PRIMARY KEY NOT NULL,
 		FIELD JSONB
+		%s
 	)`
-
-	timeFormatTemplate = `2006-01-02 15:04:05.000000-07:00`
 )
 
 type ycsb struct {
@@ -98,13 +103,18 @@ type ycsb struct {
 	json        bool
 	families    bool
 	sfu         bool
+	rehome      bool
 	splits      int
 
 	workload                                                        string
+	regionPlacement                                                        string
+	regionString                                                        string
+	regions []string
 	requestDistribution                                             string
 	scanLengthDistribution                                          string
 	minScanLength, maxScanLength                                    uint64
 	readFreq, insertFreq, updateFreq, scanFreq, readModifyWriteFreq float32
+	localInsertFreq float32
 }
 
 func init() {
@@ -132,8 +142,11 @@ var ycsbMeta = workload.Meta{
 		g.flags.BoolVar(&g.json, `json`, false, `Use JSONB rather than relational data`)
 		g.flags.BoolVar(&g.families, `families`, true, `Place each column in its own column family`)
 		g.flags.BoolVar(&g.sfu, `select-for-update`, true, `Use SELECT FOR UPDATE syntax in read-modify-write transactions`)
+		g.flags.BoolVar(&g.rehome, `auto-rehome`, false, `Automatically rehome rows in REGIONAL BY ROW`)
 		g.flags.IntVar(&g.splits, `splits`, 0, `Number of splits to perform before starting normal operations`)
 		g.flags.StringVar(&g.workload, `workload`, `B`, `Workload type. Choose from A-F.`)
+		g.flags.StringVar(&g.regionPlacement, `region-placement`, `none`, `Multi-region placement distribution. Choose from [none, A-C, computed].`)
+		g.flags.StringVar(&g.regionString, `regions`, ``, `Comma-separated list of regions to insert into.`)
 		g.flags.StringVar(&g.requestDistribution, `request-distribution`, ``, `Distribution for request key generation [zipfian, uniform, latest]. The default for workloads A, B, C, E, and F is zipfian, and the default for workload D is latest.`)
 		g.flags.StringVar(&g.scanLengthDistribution, `scan-length-distribution`, `uniform`, `Distribution for scan length generation [zipfian, uniform]. Primarily used for workload E.`)
 		g.flags.Uint64Var(&g.minScanLength, `min-scan-length`, 1, `The minimum length for scan operations. Primarily used for workload E.`)
@@ -187,6 +200,34 @@ func (g *ycsb) Hooks() workload.Hooks {
 				return errors.Errorf("Unknown workload: %q", g.workload)
 			}
 
+			switch g.regionPlacement {
+			case "none":
+				updateSchemasForMultiregion(false, false, g.rehome)
+			case "A":
+				g.localInsertFreq = 1
+				updateSchemasForMultiregion(true, false, g.rehome)
+			case "B":
+				g.localInsertFreq = .95
+				updateSchemasForMultiregion(true, false, g.rehome)
+			case "C":
+				g.localInsertFreq = .5
+				updateSchemasForMultiregion(true, false, g.rehome)
+			case "computed":
+				updateSchemasForMultiregion(true, true, g.rehome)
+			default:
+				return errors.Errorf("Unknown region placement: %q", g.regionPlacement)
+			}
+
+			if g.regionPlacement != "none" {
+				regions := strings.Split(g.regionString, ",")
+				for _, region := range regions {
+					if region == "" {
+						return errors.Errorf("Got empty region despite region placement policy: %q", g.regionPlacement)
+					}
+				}
+				g.regions = regions
+			}
+
 			if !g.flags.Lookup(`families`).Changed {
 				// If `--families` was not specified, default its value to the
 				// configuration that we expect to lead to better performance.
@@ -201,6 +242,32 @@ func (g *ycsb) Hooks() workload.Hooks {
 			}
 			return nil
 		},
+	}
+}
+
+func updateSchemasForMultiregion(multiregion, computed, rehome bool) {
+	regionalByRowCol := `, crdb_region crdb_internal_region`
+	regionalByRowDDL := ` LOCALITY REGIONAL BY ROW`
+
+	if multiregion {
+		if rehome {
+			regionalByRowCol += ` ON UPDATE default_to_database_primary_region(gateway_region())::crdb_internal_region`
+		}
+
+		if computed {
+			regionalByRowCol += ` DEFAULT default_to_database_primary_region(gateway_region())::crdb_internal_region`
+		} else {
+			// Need to update usertableTypes so that the `cockroach workload init` will explicitly place rows in regions.
+			usertableTypes = append(usertableTypes, types.Bytes)
+		}
+
+		usertableSchemaRelational = fmt.Sprintf(usertableSchemaRelational, regionalByRowCol) + regionalByRowDDL
+		usertableSchemaRelationalWithFamilies = fmt.Sprintf(usertableSchemaRelationalWithFamilies, regionalByRowCol) + regionalByRowDDL
+		usertableSchemaJSON = fmt.Sprintf(usertableSchemaJSON, regionalByRowCol) + regionalByRowDDL
+	} else {
+		usertableSchemaRelational = fmt.Sprintf(usertableSchemaRelational, "")
+		usertableSchemaRelationalWithFamilies = fmt.Sprintf(usertableSchemaRelationalWithFamilies, "")
+		usertableSchemaJSON = fmt.Sprintf(usertableSchemaJSON, "")
 	}
 }
 
@@ -330,11 +397,17 @@ func (g *ycsb) Tables() []workload.Table {
 				// coldata.Bytes only allows appends so we have to reset it.
 				key.Reset()
 
-				var fields [numTableFields]*coldata.Bytes
+				fields := make([]*coldata.Bytes, numTableFields)
 				for i := range fields {
 					fields[i] = cb.ColVec(i + 1).Bytes()
 					// coldata.Bytes only allows appends so we have to reset it.
 					fields[i].Reset()
+				}
+
+				if g.localInsertFreq > 0 {
+					toSet := cb.ColVec(len(fields) + 1).Bytes()
+					toSet.Reset()
+					fields = append(fields, toSet)
 				}
 
 				w := ycsbWorker{
@@ -342,6 +415,7 @@ func (g *ycsb) Tables() []workload.Table {
 					hashFunc: fnv.New64(),
 				}
 				rng := rand.NewSource(g.seed + uint64(batchIdx))
+				randRng := rand.New(rng)
 
 				var tmpbuf [fieldLength]byte
 				for rowIdx := rowBegin; rowIdx < rowEnd; rowIdx++ {
@@ -349,9 +423,13 @@ func (g *ycsb) Tables() []workload.Table {
 
 					key.Set(rowOffset, []byte(w.buildKeyName(uint64(rowIdx))))
 
-					for i := range fields {
+					for i := 0; i < numTableFields; i++ {
 						randStringLetters(rng, tmpbuf[:])
 						fields[i].Set(rowOffset, tmpbuf[:])
+					}
+
+					if g.localInsertFreq > 0 {
+						fields[len(fields) - 1].Set(rowOffset, []byte(g.chooseRegion(randRng)))
 					}
 				}
 			},
@@ -405,9 +483,16 @@ func (g *ycsb) Ops(
 		return workload.QueryLoad{}, err
 	}
 
+	regionInsert := ""
+	// If the region placement policy is a randomly-distributed one, allow for the insert statement to go into
+	// crdb_region
+	if strings.Contains("ABC", g.regionPlacement) {
+		regionInsert = `, $12`
+	}
+
 	var insertStmt *gosql.Stmt
 	if g.json {
-		insertStmt, err = db.Prepare(`INSERT INTO usertable VALUES ($1, json_build_object(
+		insertStmt, err = db.Prepare(fmt.Sprintf(`INSERT INTO usertable VALUES ($1, json_build_object(
 			'field0',  $2:::text,
 			'field1',  $3:::text,
 			'field2',  $4:::text,
@@ -418,11 +503,11 @@ func (g *ycsb) Ops(
 			'field7',  $9:::text,
 			'field8',  $10:::text,
 			'field9',  $11:::text
-		))`)
+		) %s)`, regionInsert))
 	} else {
-		insertStmt, err = db.Prepare(`INSERT INTO usertable VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
-		)`)
+		insertStmt, err = db.Prepare(fmt.Sprintf(`INSERT INTO usertable VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 %s
+		)`, regionInsert))
 	}
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -685,12 +770,19 @@ func randStringLetters(rng rand.Source, buf []byte) {
 }
 
 func (yw *ycsbWorker) insertRow(ctx context.Context) error {
-	var args [numTableFields + 1]interface{}
+	args := make([]interface{}, numTableFields + 1)
+
 	keyIndex := yw.nextInsertKeyIndex()
 	args[0] = yw.buildKeyName(keyIndex)
 	for i := 1; i <= numTableFields; i++ {
 		args[i] = yw.randString(fieldLength)
 	}
+
+	// Only choose a region if we've specified a local insert frequency
+	if yw.config.localInsertFreq > 0 {
+		args = append(args, yw.config.chooseRegion(yw.rng))
+	}
+
 	if _, err := yw.insertStmt.ExecContext(ctx, args[:]...); err != nil {
 		yw.nextInsertIndex = new(uint64)
 		*yw.nextInsertIndex = keyIndex
@@ -809,4 +901,21 @@ func (yw *ycsbWorker) chooseOp() operation {
 		return scanOp
 	}
 	return readOp
+}
+
+func (g *ycsb) chooseRegion(rng *rand.Rand) string {
+	if g.localInsertFreq <= 0 {
+		panic(errors.New("asked to choose a region, but local insert frequency was 0"))
+	}
+
+	p := rng.Float32()
+
+	if p <= g.localInsertFreq {
+		return g.regions[0]
+	}
+
+	regionsToConsider := g.regions[1:]
+	regionInd := rng.Intn(len(regionsToConsider))
+
+	return regionsToConsider[regionInd]
 }
