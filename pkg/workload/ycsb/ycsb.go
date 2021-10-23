@@ -19,6 +19,7 @@ import (
 	"hash"
 	"hash/fnv"
 	"math"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -103,13 +104,17 @@ type ycsb struct {
 	json        bool
 	families    bool
 	sfu         bool
-	rehome      bool
 	splits      int
 
 	workload                                                        string
 	regionPlacement                                                        string
+	rbrColType string
 	regionString                                                        string
+	regionSpace int
+	numRegions int
 	regions []string
+	remoteKeysString string
+	remoteKeys []int
 	requestDistribution                                             string
 	scanLengthDistribution                                          string
 	minScanLength, maxScanLength                                    uint64
@@ -142,11 +147,13 @@ var ycsbMeta = workload.Meta{
 		g.flags.BoolVar(&g.json, `json`, false, `Use JSONB rather than relational data`)
 		g.flags.BoolVar(&g.families, `families`, true, `Place each column in its own column family`)
 		g.flags.BoolVar(&g.sfu, `select-for-update`, true, `Use SELECT FOR UPDATE syntax in read-modify-write transactions`)
-		g.flags.BoolVar(&g.rehome, `auto-rehome`, false, `Automatically rehome rows in REGIONAL BY ROW`)
+		g.flags.StringVar(&g.rbrColType, `rbr-col`, "none", `REGIONAL BY ROW column type (none, default, rehoming, computed, partitioned) (Default: none)`)
 		g.flags.IntVar(&g.splits, `splits`, 0, `Number of splits to perform before starting normal operations`)
 		g.flags.StringVar(&g.workload, `workload`, `B`, `Workload type. Choose from A-F.`)
-		g.flags.StringVar(&g.regionPlacement, `region-placement`, `none`, `Multi-region placement distribution. Choose from [none, A-C, computed].`)
+		g.flags.StringVar(&g.regionPlacement, `region-placement`, `none`, `Multi-region placement distribution. Choose from [none, A-C].`)
 		g.flags.StringVar(&g.regionString, `regions`, ``, `Comma-separated list of regions to insert into.`)
+		g.flags.IntVar(&g.regionSpace, `region-space`, 0, `Per-region key space size`)
+		g.flags.StringVar(&g.remoteKeysString, `remote-keylocs`, "", `Key starts for remote regions`)
 		g.flags.StringVar(&g.requestDistribution, `request-distribution`, ``, `Distribution for request key generation [zipfian, uniform, latest]. The default for workloads A, B, C, E, and F is zipfian, and the default for workload D is latest.`)
 		g.flags.StringVar(&g.scanLengthDistribution, `scan-length-distribution`, `uniform`, `Distribution for scan length generation [zipfian, uniform]. Primarily used for workload E.`)
 		g.flags.Uint64Var(&g.minScanLength, `min-scan-length`, 1, `The minimum length for scan operations. Primarily used for workload E.`)
@@ -172,6 +179,9 @@ func (g *ycsb) Hooks() workload.Hooks {
 	return workload.Hooks{
 		Validate: func() error {
 			g.workload = strings.ToUpper(g.workload)
+
+			// need to track initial val to let user override
+			oldRequestDistribution := g.requestDistribution
 			switch g.workload {
 			case "A":
 				g.readFreq = 0.5
@@ -199,21 +209,31 @@ func (g *ycsb) Hooks() workload.Hooks {
 			default:
 				return errors.Errorf("Unknown workload: %q", g.workload)
 			}
+			if oldRequestDistribution !=  "" {
+				g.requestDistribution = oldRequestDistribution
+			}
+
+			remoteKeyLocs := make([]int, 0)
+			if g.remoteKeysString != "" {
+				locs := strings.Split(g.remoteKeysString, ",")
+				for _, val := range locs {
+					loc, err := strconv.Atoi(val)
+					if err != nil {
+						return errors.Errorf("failed to convert key loc %s to int", val)
+					}
+					remoteKeyLocs = append(remoteKeyLocs, loc)
+				}
+			}
+			g.remoteKeys = remoteKeyLocs
 
 			switch g.regionPlacement {
 			case "none":
-				updateSchemasForMultiregion(false, false, g.rehome)
 			case "A":
 				g.localInsertFreq = 1
-				updateSchemasForMultiregion(true, false, g.rehome)
 			case "B":
 				g.localInsertFreq = .95
-				updateSchemasForMultiregion(true, false, g.rehome)
 			case "C":
 				g.localInsertFreq = .5
-				updateSchemasForMultiregion(true, false, g.rehome)
-			case "computed":
-				updateSchemasForMultiregion(true, true, g.rehome)
 			default:
 				return errors.Errorf("Unknown region placement: %q", g.regionPlacement)
 			}
@@ -226,7 +246,12 @@ func (g *ycsb) Hooks() workload.Hooks {
 					}
 				}
 				g.regions = regions
+				g.numRegions = len(g.regions)
+			} else {
+				g.numRegions = 1
 			}
+
+			g.buildCrdbRegion()
 
 			if !g.flags.Lookup(`families`).Changed {
 				// If `--families` was not specified, default its value to the
@@ -245,30 +270,80 @@ func (g *ycsb) Hooks() workload.Hooks {
 	}
 }
 
-func updateSchemasForMultiregion(multiregion, computed, rehome bool) {
-	regionalByRowCol := `, crdb_region crdb_internal_region`
-	regionalByRowDDL := ` LOCALITY REGIONAL BY ROW`
+const (
+	rbrDefaultCol = `, crdb_region crdb_internal_region`
+	rbrDefaultExpression = rbrDefaultCol + ` DEFAULT default_to_database_primary_region(gateway_region())::crdb_internal_region`
+	rbrOnUpdateExpression = rbrDefaultExpression + ` ON UPDATE default_to_database_primary_region(gateway_region())::crdb_internal_region`
+	rbrComputedExpression = ` AS (CASE %s END) STORED`
+	rbrComputedCase = ` WHEN ltrim(ycsb_key, 'user')::INT >= %d AND ltrim(ycsb_key, 'user')::INT < %d THEN '%s' `
+	rbrDDL = ` LOCALITY REGIONAL BY ROW`
+	partitionStmt = `PARTITION BY LIST (crdb_region) (%s)`
+	partitionExpr = `PARTITION "%[1]s" VALUES IN (('%[1]s'))`
+	partitionIndex = `, crdb_region STRING NOT NULL,
+PRIMARY KEY (crdb_region, ycsb_key),
+UNIQUE INDEX uniq_keys (crdb_region, ycsb_key) `
+)
 
-	if multiregion {
-		if rehome {
-			regionalByRowCol += ` ON UPDATE default_to_database_primary_region(gateway_region())::crdb_internal_region`
-		}
+func (g *ycsb) buildCrdbRegion() {
+	colAdditions := ""
+	ddlAdditions := ""
 
-		if computed {
-			regionalByRowCol += ` DEFAULT default_to_database_primary_region(gateway_region())::crdb_internal_region`
-		} else {
-			// Need to update usertableTypes so that the `cockroach workload init` will explicitly place rows in regions.
-			usertableTypes = append(usertableTypes, types.Bytes)
-		}
-
-		usertableSchemaRelational = fmt.Sprintf(usertableSchemaRelational, regionalByRowCol) + regionalByRowDDL
-		usertableSchemaRelationalWithFamilies = fmt.Sprintf(usertableSchemaRelationalWithFamilies, regionalByRowCol) + regionalByRowDDL
-		usertableSchemaJSON = fmt.Sprintf(usertableSchemaJSON, regionalByRowCol) + regionalByRowDDL
-	} else {
-		usertableSchemaRelational = fmt.Sprintf(usertableSchemaRelational, "")
-		usertableSchemaRelationalWithFamilies = fmt.Sprintf(usertableSchemaRelationalWithFamilies, "")
-		usertableSchemaJSON = fmt.Sprintf(usertableSchemaJSON, "")
+	switch g.rbrColType {
+	case "none":
+		colAdditions = ""
+		ddlAdditions = ""
+	case "computed":
+		colAdditions += fmt.Sprintf(rbrComputedExpression, buildRbrCaseExprs(g.regionSpace, g.regions))
+		ddlAdditions += rbrDDL
+	case "default":
+		colAdditions += rbrDefaultExpression
+		ddlAdditions += rbrDDL
+		usertableTypes = append(usertableTypes, types.Bytes)
+	case "rehoming":
+		colAdditions += rbrOnUpdateExpression
+		ddlAdditions += rbrDDL
+		usertableTypes = append(usertableTypes, types.Bytes)
+	case "partitioned":
+		partitions := buildPartitions(g.regions)
+		colAdditions += partitionIndex + partitions
+		ddlAdditions += partitions
+		usertableTypes = append(usertableTypes, types.Bytes)
+		clearPrimaryKeys()
 	}
+
+	usertableSchemaRelational = fmt.Sprintf(usertableSchemaRelational, colAdditions) + ddlAdditions
+	usertableSchemaRelationalWithFamilies = fmt.Sprintf(usertableSchemaRelationalWithFamilies, colAdditions) + ddlAdditions
+	usertableSchemaJSON = fmt.Sprintf(usertableSchemaJSON, colAdditions) + ddlAdditions
+}
+
+func clearPrimaryKeys() {
+	usertableSchemaRelational = strings.ReplaceAll(usertableSchemaRelational, "PRIMARY KEY", "")
+	usertableSchemaRelationalWithFamilies = strings.ReplaceAll(usertableSchemaRelationalWithFamilies, "PRIMARY KEY", "")
+	usertableSchemaJSON = strings.ReplaceAll(usertableSchemaJSON, "PRIMARY KEY", "")
+}
+
+func buildRbrCaseExprs(regionSpace int, regionNames []string) string {
+	caseExpr := ""
+	for i, _ := range regionNames {
+		for j, regionName := range regionNames {
+			startKey := (i * len(regionNames) + j) * regionSpace
+			endKey := startKey + regionSpace
+			caseExpr += fmt.Sprintf(rbrComputedCase, startKey, endKey, regionName)
+		}
+	}
+	caseExpr += fmt.Sprintf("ELSE '%s'", regionNames[0])
+	return caseExpr
+}
+
+func buildPartitions(regionNames []string) string {
+	partitions := ""
+	for i, name := range regionNames {
+		partitions += fmt.Sprintf(partitionExpr, name)
+		if i < len(regionNames) - 1 {
+			partitions += ","
+		}
+	}
+	return fmt.Sprintf(partitionStmt, partitions)
 }
 
 // preferColumnFamilies returns whether we expect the use of column families to
@@ -383,13 +458,16 @@ func (g *ycsb) Tables() []workload.Table {
 			usertable.Schema = usertableSchemaRelational
 		}
 
+		totalRowsToInsert := g.insertCount * g.numRegions * g.numRegions
+
 		const batchSize = 1000
 		usertable.InitialRows = workload.BatchedTuples{
-			NumBatches: (g.insertCount + batchSize - 1) / batchSize,
+			// Have to bump this by the number of regions squared so each region gets a disjoint keyspace to operate on.
+			NumBatches: (totalRowsToInsert  + batchSize - 1) / batchSize,
 			FillBatch: func(batchIdx int, cb coldata.Batch, _ *bufalloc.ByteAllocator) {
 				rowBegin, rowEnd := batchIdx*batchSize, (batchIdx+1)*batchSize
-				if rowEnd > g.insertCount {
-					rowEnd = g.insertCount
+				if rowEnd > totalRowsToInsert {
+					rowEnd = totalRowsToInsert
 				}
 				cb.Reset(usertableTypes, rowEnd-rowBegin, coldata.StandardColumnFactory)
 
@@ -404,7 +482,7 @@ func (g *ycsb) Tables() []workload.Table {
 					fields[i].Reset()
 				}
 
-				if g.localInsertFreq > 0 {
+				if g.rbrColType == "default" || g.rbrColType == "rehoming" || g.rbrColType == "partitioned" {
 					toSet := cb.ColVec(len(fields) + 1).Bytes()
 					toSet.Reset()
 					fields = append(fields, toSet)
@@ -415,27 +493,32 @@ func (g *ycsb) Tables() []workload.Table {
 					hashFunc: fnv.New64(),
 				}
 				rng := rand.NewSource(g.seed + uint64(batchIdx))
-				randRng := rand.New(rng)
 
 				var tmpbuf [fieldLength]byte
 				for rowIdx := rowBegin; rowIdx < rowEnd; rowIdx++ {
 					rowOffset := rowIdx - rowBegin
 
-					key.Set(rowOffset, []byte(w.buildKeyName(uint64(rowIdx))))
+					key.Set(rowOffset, []byte(w.buildKeyNameFromIndex(uint64(rowIdx))))
 
 					for i := 0; i < numTableFields; i++ {
 						randStringLetters(rng, tmpbuf[:])
 						fields[i].Set(rowOffset, tmpbuf[:])
 					}
 
-					if g.localInsertFreq > 0 {
-						fields[len(fields) - 1].Set(rowOffset, []byte(g.chooseRegion(randRng)))
+					if g.rbrColType == "default" || g.rbrColType == "rehoming" || g.rbrColType == "partitioned" {
+						fields[len(fields) - 1].Set(rowOffset, []byte(g.regionForIdx(rowIdx)))
 					}
 				}
 			},
 		}
 	}
 	return []workload.Table{usertable}
+}
+
+func (g *ycsb) regionForIdx(rowIdx int) string {
+	numRegionsSeen := rowIdx / g.insertCount
+	regionIdx := numRegionsSeen % len(g.regions)
+	return g.regions[regionIdx]
 }
 
 // Ops implements the Opser interface.
@@ -483,16 +566,9 @@ func (g *ycsb) Ops(
 		return workload.QueryLoad{}, err
 	}
 
-	regionInsert := ""
-	// If the region placement policy is a randomly-distributed one, allow for the insert statement to go into
-	// crdb_region
-	if strings.Contains("ABC", g.regionPlacement) {
-		regionInsert = `, $12`
-	}
-
 	var insertStmt *gosql.Stmt
 	if g.json {
-		insertStmt, err = db.Prepare(fmt.Sprintf(`INSERT INTO usertable VALUES ($1, json_build_object(
+		insertStmt, err = db.Prepare(`INSERT INTO usertable VALUES ($1, json_build_object(
 			'field0',  $2:::text,
 			'field1',  $3:::text,
 			'field2',  $4:::text,
@@ -503,11 +579,11 @@ func (g *ycsb) Ops(
 			'field7',  $9:::text,
 			'field8',  $10:::text,
 			'field9',  $11:::text
-		) %s)`, regionInsert))
+		))`)
 	} else {
-		insertStmt, err = db.Prepare(fmt.Sprintf(`INSERT INTO usertable VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 %s
-		)`, regionInsert))
+		insertStmt, err = db.Prepare(`INSERT INTO usertable VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+		)`)
 	}
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -675,10 +751,20 @@ func (yw *ycsbWorker) hashKey(key uint64) uint64 {
 	return yw.hashFunc.Sum64()
 }
 
+func (yw *ycsbWorker) buildKeyNameFromIndex(keynum uint64) string {
+	// If we are in multiple regions, calculate how offset the key should be.
+	regionIdx := keynum / uint64(yw.config.insertCount)
+	regionOffset := regionIdx * uint64(yw.config.regionSpace)
+	keynum = (keynum % uint64(yw.config.insertCount)) + regionOffset
+
+	return yw.buildKeyName(keynum + uint64(yw.config.insertStart))
+}
+
 func (yw *ycsbWorker) buildKeyName(keynum uint64) string {
 	if yw.config.insertHash {
 		return keyNameFromHash(yw.hashKey(keynum))
 	}
+
 	return keyNameFromOrder(keynum, yw.config.zeroPadding)
 }
 
@@ -690,11 +776,30 @@ func keyNameFromOrder(keynum uint64, zeroPadding int) string {
 	return fmt.Sprintf("user%0*d", zeroPadding, keynum)
 }
 
+func (yw *ycsbWorker) nextReadKey() string {
+	if yw.config.localInsertFreq <= 0 {
+		return yw.nextLocalReadKey()
+	}
+
+	p := yw.rng.Float32()
+
+	if p <= yw.config.localInsertFreq {
+		return yw.nextLocalReadKey()
+	}
+
+	keyLocsToConsider := yw.config.remoteKeys
+	keyInd := yw.rng.Intn(len(keyLocsToConsider))
+	startKey := uint64(keyLocsToConsider[keyInd])
+	rowIndex := yw.requestGen.Uint64() % uint64(yw.config.insertCount)
+
+	return yw.buildKeyName(startKey + rowIndex)
+}
+
 // Keys are chosen by first drawing from a Zipf distribution, hashing the drawn
 // value, and modding by the total number of rows, so that not all hot keys are
 // close together.
 // See YCSB paper section 5.3 for a complete description of how keys are chosen.
-func (yw *ycsbWorker) nextReadKey() string {
+func (yw *ycsbWorker) nextLocalReadKey() string {
 	rowCount := yw.rowCounter.Last()
 	// TODO(jeffreyxiao): The official YCSB implementation creates a very large
 	// key space for the zipfian distribution, hashes, mods it by the number of
@@ -713,8 +818,11 @@ func (yw *ycsbWorker) nextReadKey() string {
 	// key). The distribution is also slightly different than the official YCSB's
 	// distribution, so it might be worthwhile to exactly emulate what they're
 	// doing.
-	rowIndex := yw.requestGen.Uint64() % rowCount
-	return yw.buildKeyName(rowIndex)
+
+	// We don't want to query anything before insertStart, so factor it out before
+	// doing the mod.
+	rowIndex := yw.requestGen.Uint64() % (rowCount - uint64(yw.config.insertStart))
+	return yw.buildKeyName(rowIndex + uint64(yw.config.insertStart))
 }
 
 func (yw *ycsbWorker) nextInsertKeyIndex() uint64 {
@@ -776,11 +884,6 @@ func (yw *ycsbWorker) insertRow(ctx context.Context) error {
 	args[0] = yw.buildKeyName(keyIndex)
 	for i := 1; i <= numTableFields; i++ {
 		args[i] = yw.randString(fieldLength)
-	}
-
-	// Only choose a region if we've specified a local insert frequency
-	if yw.config.localInsertFreq > 0 {
-		args = append(args, yw.config.chooseRegion(yw.rng))
 	}
 
 	if _, err := yw.insertStmt.ExecContext(ctx, args[:]...); err != nil {
