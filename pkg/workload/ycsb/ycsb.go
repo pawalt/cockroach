@@ -104,6 +104,8 @@ type ycsb struct {
 	json        bool
 	families    bool
 	sfu         bool
+	stale       bool
+	upsert      bool
 	splits      int
 
 	workload                                                        string
@@ -158,6 +160,8 @@ var ycsbMeta = workload.Meta{
 		g.flags.StringVar(&g.scanLengthDistribution, `scan-length-distribution`, `uniform`, `Distribution for scan length generation [zipfian, uniform]. Primarily used for workload E.`)
 		g.flags.Uint64Var(&g.minScanLength, `min-scan-length`, 1, `The minimum length for scan operations. Primarily used for workload E.`)
 		g.flags.Uint64Var(&g.maxScanLength, `max-scan-length`, 1000, `The maximum length for scan operations. Primarily used for workload E.`)
+		g.flags.BoolVar(&g.stale, `stale`, false, `Use bounded staleness reads in read-only queries`)
+		g.flags.BoolVar(&g.upsert, `upsert`, false, `Use upserts instead of updates to perform blind-writes`)
 
 		// TODO(dan): g.flags.Uint64Var(&g.maxWrites, `max-writes`,
 		//     7*24*3600*1500,  // 7 days at 5% writes and 30k ops/s
@@ -213,6 +217,10 @@ func (g *ycsb) Hooks() workload.Hooks {
 				g.requestDistribution = oldRequestDistribution
 			}
 
+			if g.rbrColType == "partitioned" || g.rbrColType == "computed" {
+				g.zeroPadding = 10
+			}
+
 			remoteKeyLocs := make([]int, 0)
 			if g.remoteKeysString != "" {
 				locs := strings.Split(g.remoteKeysString, ",")
@@ -259,12 +267,32 @@ func (g *ycsb) Hooks() workload.Hooks {
 				g.families = preferColumnFamilies(g.workload)
 			}
 
+			if g.families && g.upsert {
+				return errors.Errorf("if --upsert is true, --families must be false")
+			}
+
 			if g.recordCount == 0 {
 				g.recordCount = g.insertStart + g.insertCount
 			}
 			if g.insertStart+g.insertCount > g.recordCount {
 				return errors.Errorf("insertStart + insertCount (%d) must be <= recordCount (%d)", g.insertStart+g.insertCount, g.recordCount)
 			}
+			return nil
+		},
+		PreLoad: func(db *gosql.DB) error {
+			// If we're using a manually partitioned table, we have to make sure it gets zone configurations applied.
+			if g.rbrColType == "partitioned" {
+				for i, _ := range g.regions {
+					for _, regionName := range g.regions {
+						_, err := db.Exec(fmt.Sprintf(`ALTER PARTITION "%[1]s-%[2]d" OF INDEX usertable@usertable_pkey
+CONFIGURE ZONE USING constraints='[+region=%[1]s]';`, regionName, i))
+						if err != nil {
+							return err
+						}
+					}
+				}
+			}
+
 			return nil
 		},
 	}
@@ -274,14 +302,11 @@ const (
 	rbrDefaultCol = `, crdb_region crdb_internal_region`
 	rbrDefaultExpression = rbrDefaultCol + ` DEFAULT default_to_database_primary_region(gateway_region())::crdb_internal_region`
 	rbrOnUpdateExpression = rbrDefaultExpression + ` ON UPDATE default_to_database_primary_region(gateway_region())::crdb_internal_region`
-	rbrComputedExpression = ` AS (CASE %s END) STORED`
-	rbrComputedCase = ` WHEN ltrim(ycsb_key, 'user')::INT >= %d AND ltrim(ycsb_key, 'user')::INT < %d THEN '%s' `
+	rbrComputedExpression = rbrDefaultCol + ` AS (CASE %s END) STORED`
+	rbrComputedCase = ` WHEN ycsb_key >= '%s' AND ycsb_key < '%s' THEN '%s' `
 	rbrDDL = ` LOCALITY REGIONAL BY ROW`
-	partitionStmt = `PARTITION BY LIST (crdb_region) (%s)`
-	partitionExpr = `PARTITION "%[1]s" VALUES IN (('%[1]s'))`
-	partitionIndex = `, crdb_region STRING NOT NULL,
-PRIMARY KEY (crdb_region, ycsb_key),
-UNIQUE INDEX uniq_keys (crdb_region, ycsb_key) `
+	partitionStmt = `PARTITION BY RANGE (ycsb_key) (%s)`
+	partitionExpr = `PARTITION "%s" VALUES FROM ('%s') TO ('%s'),`
 )
 
 func (g *ycsb) buildCrdbRegion() {
@@ -293,7 +318,7 @@ func (g *ycsb) buildCrdbRegion() {
 		colAdditions = ""
 		ddlAdditions = ""
 	case "computed":
-		colAdditions += fmt.Sprintf(rbrComputedExpression, buildRbrCaseExprs(g.regionSpace, g.regions))
+		colAdditions += fmt.Sprintf(rbrComputedExpression, buildRbrCaseExprs(g.regionSpace, g.regions, g.zeroPadding))
 		ddlAdditions += rbrDDL
 	case "default":
 		colAdditions += rbrDefaultExpression
@@ -304,46 +329,42 @@ func (g *ycsb) buildCrdbRegion() {
 		ddlAdditions += rbrDDL
 		usertableTypes = append(usertableTypes, types.Bytes)
 	case "partitioned":
-		partitions := buildPartitions(g.regions)
-		colAdditions += partitionIndex + partitions
+		partitions := buildPartitions(g.regionSpace, g.regions, g.zeroPadding)
 		ddlAdditions += partitions
-		usertableTypes = append(usertableTypes, types.Bytes)
-		clearPrimaryKeys()
 	}
 
 	usertableSchemaRelational = fmt.Sprintf(usertableSchemaRelational, colAdditions) + ddlAdditions
 	usertableSchemaRelationalWithFamilies = fmt.Sprintf(usertableSchemaRelationalWithFamilies, colAdditions) + ddlAdditions
 	usertableSchemaJSON = fmt.Sprintf(usertableSchemaJSON, colAdditions) + ddlAdditions
+
+	fmt.Println(usertableSchemaRelational)
 }
 
-func clearPrimaryKeys() {
-	usertableSchemaRelational = strings.ReplaceAll(usertableSchemaRelational, "PRIMARY KEY", "")
-	usertableSchemaRelationalWithFamilies = strings.ReplaceAll(usertableSchemaRelationalWithFamilies, "PRIMARY KEY", "")
-	usertableSchemaJSON = strings.ReplaceAll(usertableSchemaJSON, "PRIMARY KEY", "")
-}
-
-func buildRbrCaseExprs(regionSpace int, regionNames []string) string {
+func buildRbrCaseExprs(regionSpace int, regionNames []string, padding int) string {
 	caseExpr := ""
 	for i, _ := range regionNames {
 		for j, regionName := range regionNames {
-			startKey := (i * len(regionNames) + j) * regionSpace
-			endKey := startKey + regionSpace
-			caseExpr += fmt.Sprintf(rbrComputedCase, startKey, endKey, regionName)
+			startKey := uint64((i * len(regionNames) + j) * regionSpace)
+			endKey := startKey + uint64(regionSpace)
+			caseExpr += fmt.Sprintf(rbrComputedCase, keyNameFromOrder(startKey, padding), keyNameFromOrder(endKey, padding), regionName)
 		}
 	}
 	caseExpr += fmt.Sprintf("ELSE '%s'", regionNames[0])
 	return caseExpr
 }
 
-func buildPartitions(regionNames []string) string {
-	partitions := ""
-	for i, name := range regionNames {
-		partitions += fmt.Sprintf(partitionExpr, name)
-		if i < len(regionNames) - 1 {
-			partitions += ","
+func buildPartitions(regionSpace int, regionNames []string, padding int) string {
+	caseExpr := ""
+	for i, _ := range regionNames {
+		for j, regionName := range regionNames {
+			startKey := uint64((i * len(regionNames) + j) * regionSpace)
+			endKey := startKey + uint64(regionSpace) - 1
+			caseExpr += fmt.Sprintf(partitionExpr, regionName + "-" + strconv.Itoa(i), keyNameFromOrder(startKey, padding) , keyNameFromOrder(endKey, padding))
 		}
 	}
-	return fmt.Sprintf(partitionStmt, partitions)
+	// Remove trailing comma in case statement
+	caseExpr = caseExpr[:len(caseExpr) - 1]
+	return fmt.Sprintf(partitionStmt, caseExpr)
 }
 
 // preferColumnFamilies returns whether we expect the use of column families to
@@ -482,7 +503,7 @@ func (g *ycsb) Tables() []workload.Table {
 					fields[i].Reset()
 				}
 
-				if g.rbrColType == "default" || g.rbrColType == "rehoming" || g.rbrColType == "partitioned" {
+				if g.rbrColType == "default" || g.rbrColType == "rehoming" {
 					toSet := cb.ColVec(len(fields) + 1).Bytes()
 					toSet.Reset()
 					fields = append(fields, toSet)
@@ -505,7 +526,7 @@ func (g *ycsb) Tables() []workload.Table {
 						fields[i].Set(rowOffset, tmpbuf[:])
 					}
 
-					if g.rbrColType == "default" || g.rbrColType == "rehoming" || g.rbrColType == "partitioned" {
+					if g.rbrColType == "default" || g.rbrColType == "rehoming" {
 						fields[len(fields) - 1].Set(rowOffset, []byte(g.regionForIdx(rowIdx)))
 					}
 				}
@@ -537,7 +558,11 @@ func (g *ycsb) Ops(
 	db.SetMaxOpenConns(g.connFlags.Concurrency + 1)
 	db.SetMaxIdleConns(g.connFlags.Concurrency + 1)
 
-	readStmt, err := db.Prepare(`SELECT * FROM usertable WHERE ycsb_key = $1`)
+	readQ := `SELECT ycsb_key, field0, field1, field2, field3, field4, field5, field6, field7, field8, field9 FROM usertable WHERE ycsb_key = $1`
+	if g.stale {
+		readQ = `SELECT ycsb_key, field0, field1, field2, field3, field4, field5, field6, field7, field8, field9 FROM usertable AS OF SYSTEM TIME with_max_staleness('1m') WHERE ycsb_key = $1`
+	}
+	readStmt, err := db.Prepare(readQ)
 	if err != nil {
 		return workload.QueryLoad{}, err
 	}
@@ -599,6 +624,17 @@ func (g *ycsb) Ops(
 	} else {
 		for i := 0; i < numTableFields; i++ {
 			q := fmt.Sprintf(`UPDATE usertable SET field%d = $2 WHERE ycsb_key = $1`, i)
+			if g.upsert {
+				fields := []string{`$1`}
+				for j := 0; j < numTableFields; j++ {
+					f := `''`
+					if i == j {
+						f = `$2`
+					}
+					fields = append(fields, f)
+				}
+				q = fmt.Sprintf(`UPSERT INTO usertable VALUES (%s)`, strings.Join(fields, ", "))
+			}
 			stmt, err := db.Prepare(q)
 			if err != nil {
 				return workload.QueryLoad{}, err
@@ -726,6 +762,8 @@ func (yw *ycsbWorker) run(ctx context.Context) error {
 
 	elapsed := timeutil.Since(start)
 	yw.hists.Get(string(op)).Record(elapsed)
+	// Used for CDF generation.
+	fmt.Printf("LATENCY: %s %d\n", op, elapsed.Nanoseconds())
 	return nil
 }
 
@@ -1004,21 +1042,4 @@ func (yw *ycsbWorker) chooseOp() operation {
 		return scanOp
 	}
 	return readOp
-}
-
-func (g *ycsb) chooseRegion(rng *rand.Rand) string {
-	if g.localInsertFreq <= 0 {
-		panic(errors.New("asked to choose a region, but local insert frequency was 0"))
-	}
-
-	p := rng.Float32()
-
-	if p <= g.localInsertFreq {
-		return g.regions[0]
-	}
-
-	regionsToConsider := g.regions[1:]
-	regionInd := rng.Intn(len(regionsToConsider))
-
-	return regionsToConsider[regionInd]
 }
