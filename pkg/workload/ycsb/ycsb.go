@@ -113,6 +113,7 @@ type ycsb struct {
 	rbrColType string
 	regionString                                                        string
 	regionSpace int
+	remoteRegionSize int
 	numRegions int
 	regions []string
 	remoteKeysString string
@@ -155,6 +156,7 @@ var ycsbMeta = workload.Meta{
 		g.flags.StringVar(&g.regionPlacement, `region-placement`, `none`, `Multi-region placement distribution. Choose from [none, A-C].`)
 		g.flags.StringVar(&g.regionString, `regions`, ``, `Comma-separated list of regions to insert into.`)
 		g.flags.IntVar(&g.regionSpace, `region-space`, 0, `Per-region key space size`)
+		g.flags.IntVar(&g.remoteRegionSize, `remote-region-size`, 0, `Per-remote-region key length to query against`)
 		g.flags.StringVar(&g.remoteKeysString, `remote-keylocs`, "", `Key starts for remote regions`)
 		g.flags.StringVar(&g.requestDistribution, `request-distribution`, ``, `Distribution for request key generation [zipfian, uniform, latest]. The default for workloads A, B, C, E, and F is zipfian, and the default for workload D is latest.`)
 		g.flags.StringVar(&g.scanLengthDistribution, `scan-length-distribution`, `uniform`, `Distribution for scan length generation [zipfian, uniform]. Primarily used for workload E.`)
@@ -284,7 +286,7 @@ func (g *ycsb) Hooks() workload.Hooks {
 			if g.rbrColType == "partitioned" {
 				for i, _ := range g.regions {
 					for _, regionName := range g.regions {
-						_, err := db.Exec(fmt.Sprintf(`ALTER PARTITION "%[1]s-%[2]d" OF INDEX usertable@usertable_pkey
+						_, err := db.Exec(fmt.Sprintf(`ALTER PARTITION "%[1]s-%[2]d" OF TABLE usertable
 CONFIGURE ZONE USING constraints='[+region=%[1]s]';`, regionName, i))
 						if err != nil {
 							return err
@@ -828,7 +830,11 @@ func (yw *ycsbWorker) nextReadKey() string {
 	keyLocsToConsider := yw.config.remoteKeys
 	keyInd := yw.rng.Intn(len(keyLocsToConsider))
 	startKey := uint64(keyLocsToConsider[keyInd])
-	rowIndex := yw.requestGen.Uint64() % uint64(yw.config.insertCount)
+	remoteKeySpaceSize := yw.config.insertCount
+	if yw.config.remoteRegionSize > 0 {
+		remoteKeySpaceSize = yw.config.remoteRegionSize
+	}
+	rowIndex := yw.requestGen.Uint64() % uint64(remoteKeySpaceSize)
 
 	return yw.buildKeyName(startKey + rowIndex)
 }
